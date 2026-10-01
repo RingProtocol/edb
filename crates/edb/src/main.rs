@@ -27,6 +27,7 @@ use eyre::Result;
 
 use crate::utils::TuiOptions;
 
+mod anvil;
 mod cmd;
 mod proxy;
 mod utils;
@@ -74,6 +75,13 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "web")]
     pub ui: Ui,
 
+    /// Path to a local source config (JSON). When provided, contract sources are
+    /// compiled from the local Foundry project described in the file instead of being
+    /// downloaded from Etherscan. Useful for debugging transactions on local chains
+    /// (anvil, dev nodes) with unverified/unpublished contracts.
+    #[arg(long)]
+    pub local: Option<std::path::PathBuf>,
+
     /// Command to execute
     #[command(subcommand)]
     pub command: Commands,
@@ -101,6 +109,20 @@ impl Cli {
             .with_rpc_proxy_url(rpc_url.to_string());
         if let Some(api_key) = &self.etherscan_api_key {
             engine_config = engine_config.with_etherscan_api_key(api_key.clone());
+        }
+        if let Some(local) = &self.local {
+            match edb_engine::LocalSourceConfig::load(local) {
+                Ok(config) => {
+                    tracing::info!(
+                        "Loaded local source config with {} contracts",
+                        config.contracts.len()
+                    );
+                    engine_config = engine_config.with_local_source(config);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load --local config {:?}: {e:?}", local);
+                }
+            }
         }
         engine_config
     }
@@ -130,12 +152,41 @@ pub enum Commands {
     },
     /// Show RPC proxy provider status
     ProxyStatus,
+    /// Run the complete local debugging workflow (anvil + deploy + debug)
+    Local {
+        /// Path to the Foundry project
+        path: std::path::PathBuf,
+
+        /// Skip auto-starting anvil (expect it to be running)
+        #[arg(long)]
+        no_anvil: bool,
+
+        /// Anvil port (default: 8545)
+        #[arg(long, default_value = "8545")]
+        anvil_port: u16,
+
+        /// Skip deploying contracts (expect them to be deployed)
+        #[arg(long)]
+        no_deploy: bool,
+
+        /// Specific contract to debug (for multi-contract projects)
+        #[arg(long)]
+        contract: Option<String>,
+
+        /// Transaction hash to debug (skip test tx execution)
+        #[arg(long)]
+        tx_hash: Option<String>,
+
+        /// Deployment script path (e.g., script/Deploy.s.sol:Deploy)
+        #[arg(long)]
+        script: Option<String>,
+    },
 }
 
 impl Commands {
     /// Whether the command launches a user interface (TUI or Web).
     pub fn runs_ui(&self) -> bool {
-        matches!(self, Self::Replay { .. } | Self::Test { .. })
+        matches!(self, Self::Replay { .. } | Self::Test { .. } | Self::Local { .. })
     }
 }
 
@@ -196,5 +247,27 @@ async fn main() -> Result<()> {
             cmd::start_server(*ws_port, &cli, &effective_rpc_url).await
         }
         Commands::ProxyStatus => cmd::show_proxy_status(&cli).await,
+        Commands::Local {
+            path,
+            no_anvil,
+            anvil_port,
+            no_deploy,
+            contract,
+            tx_hash,
+            script,
+        } => {
+            tracing::info!("Starting local debugging workflow for {:?}", path);
+            cmd::run_local_workflow(
+                path.clone(),
+                *no_anvil,
+                *anvil_port,
+                *no_deploy,
+                contract.clone(),
+                tx_hash.clone(),
+                script.clone(),
+                &cli,
+            )
+            .await
+        }
     }
 }

@@ -161,8 +161,11 @@ pub async fn fork_and_prepare(
     // Get all transactions before the target
     let preceding_txs: Vec<&Transaction> = transactions.iter().take(target_index).collect();
 
-    // Get the spec ID for the block using our mainnet mapping
-    let spec_id = get_mainnet_spec_id(target_block_number);
+    // Get the spec ID for the block. On mainnet we map the block number to the
+    // historical hardfork; on any other chain (e.g. a local anvil/dev node with low
+    // block numbers) that mapping is meaningless, so use the latest known spec.
+    let spec_id =
+        if chain_id == 1 { get_mainnet_spec_id(target_block_number) } else { SpecId::default() };
     info!("Block {} is under {:?} hardfork", target_block_number, spec_id);
 
     // Create fork info

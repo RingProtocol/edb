@@ -1,0 +1,409 @@
+// EDB - Ethereum Debugger
+// Copyright (C) 2024 Zhuo Zhang and Wuqi Zhang
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//! Local command - automated local debugging workflow
+
+use std::path::{Path, PathBuf};
+
+use alloy_primitives::{Address, Bytes, TxHash};
+use edb_common::fork_and_prepare;
+use edb_engine::{DiscoveredContract, Engine, LocalContractConfig, LocalSourceConfig};
+use eyre::{Context, Result, bail};
+
+use crate::{Ui, anvil, proxy, utils};
+
+/// Run the complete local debugging workflow.
+pub async fn run_local_workflow(
+    project_path: PathBuf,
+    no_anvil: bool,
+    anvil_port: u16,
+    no_deploy: bool,
+    contract: Option<String>,
+    tx_hash: Option<String>,
+    script: Option<String>,
+    cli: &crate::Cli,
+) -> Result<()> {
+    tracing::info!("Starting local debugging workflow for {:?}", project_path);
+
+    // 1. Validate project path
+    let project_root = validate_project_path(&project_path)?;
+    tracing::info!("Project root: {:?}", project_root);
+
+    // 2. Start anvil if needed
+    let anvil_handle = if no_anvil {
+        tracing::info!("Skipping anvil startup (--no-anvil)");
+        // Verify anvil is running
+        anvil::ensure_anvil_running(anvil_port).await?
+    } else {
+        anvil::ensure_anvil_running(anvil_port).await?
+    };
+
+    let rpc_url = anvil_handle.rpc_url();
+    tracing::info!("Using RPC URL: {rpc_url}");
+
+    // 3. Ensure proxy is running
+    tracing::info!("Ensuring RPC proxy is running...");
+    proxy::ensure_proxy_running(cli).await?;
+    let proxy_rpc_url = format!("http://127.0.0.1:{}", cli.proxy_port);
+
+    // 4. Discover or load contracts
+    let local_config = if no_deploy {
+        tracing::info!("Skipping deployment (--no-deploy)");
+        load_existing_config(&project_root)?
+    } else {
+        discover_contracts(&project_root, contract.as_deref(), script.as_deref()).await?
+    };
+
+    tracing::info!(
+        "Loaded {} contracts for debugging",
+        local_config.contracts.len()
+    );
+
+    // 5. Execute test transaction or use provided tx hash
+    let target_tx_hash = if let Some(hash_str) = tx_hash {
+        hash_str.parse::<TxHash>().wrap_err("invalid transaction hash")?
+    } else {
+        execute_test_transaction(&project_root, &rpc_url).await?
+    };
+
+    tracing::info!("Target transaction: {target_tx_hash}");
+
+    // 6. Build engine config with local source
+    let mut engine_config = cli.to_engine_config(&proxy_rpc_url);
+    engine_config = engine_config.with_local_source(local_config);
+
+    // 7. Fork and prepare
+    tracing::info!("Forking chain and preparing database...");
+    let fork_result = fork_and_prepare(&proxy_rpc_url, target_tx_hash, cli.quick).await?;
+    tracing::info!(
+        "Forked at block {} for transaction replay",
+        fork_result.fork_info.block_number
+    );
+
+    // 8. Create engine and prepare
+    let engine = Engine::new(engine_config);
+    let rpc_server_addr = match cli.ui {
+        Ui::Tui => engine.prepare(fork_result, None).await?,
+        Ui::Web => engine.prepare_with_router(fork_result, None, Some(edb_web::router())).await?,
+    };
+
+    // 9. Launch UI
+    match cli.ui {
+        Ui::Tui => {
+            utils::start_tui(&cli.tui_options, rpc_server_addr).await?;
+        }
+        Ui::Web => {
+            let url = format!("http://{rpc_server_addr}/");
+            utils::open_browser(&url);
+            tracing::info!("Web UI ready. Press Ctrl+C to exit.");
+            tokio::signal::ctrl_c().await?;
+        }
+    }
+
+    // 10. Cleanup
+    tracing::info!("Shutting down EDB...");
+    engine.shutdown_rpc_server(&target_tx_hash)?;
+
+    // Anvil handle drops here, killing the process if we spawned it
+    drop(anvil_handle);
+
+    Ok(())
+}
+
+/// Validate that the project path exists and contains foundry.toml.
+fn validate_project_path(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        bail!("Project path does not exist: {:?}", path);
+    }
+
+    let project_root = if path.is_file() {
+        // If a file was provided, use its parent directory
+        path.parent()
+            .ok_or_else(|| eyre::eyre!("invalid project path"))?
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    let foundry_toml = project_root.join("foundry.toml");
+    if !foundry_toml.exists() {
+        bail!(
+            "Not a Foundry project (no foundry.toml): {:?}\n\
+             Please run this command from a Foundry project directory.",
+            project_root
+        );
+    }
+
+    Ok(project_root)
+}
+
+/// Load an existing edb.local.json config file.
+fn load_existing_config(project_root: &Path) -> Result<LocalSourceConfig> {
+    let config_path = project_root.join("edb.local.json");
+    if !config_path.exists() {
+        bail!(
+            "No edb.local.json found at {:?}\n\
+             Please create the config file or remove --no-deploy.",
+            config_path
+        );
+    }
+
+    tracing::info!("Loading config from {:?}", config_path);
+    LocalSourceConfig::load(&config_path)
+}
+
+/// Discover contracts from various sources.
+async fn discover_contracts(
+    project_root: &Path,
+    contract_name: Option<&str>,
+    script: Option<&str>,
+) -> Result<LocalSourceConfig> {
+    // Strategy 1: Check for edb.local.json
+    let config_path = project_root.join("edb.local.json");
+    if config_path.exists() {
+        tracing::info!("Found edb.local.json, using it");
+        return LocalSourceConfig::load(&config_path);
+    }
+
+    // Strategy 2: Parse broadcast directory
+    let broadcast_dir = project_root.join("broadcast");
+    if broadcast_dir.exists() {
+        tracing::info!("Parsing broadcast directory for deployed contracts");
+        if let Ok(contracts) = parse_broadcast_dir(&broadcast_dir, contract_name) {
+            if !contracts.is_empty() {
+                return Ok(LocalSourceConfig::from_discovered(
+                    project_root.to_path_buf(),
+                    None,
+                    contracts,
+                ));
+            }
+        }
+    }
+
+    // Strategy 3: Run forge script if specified
+    if let Some(script_path) = script {
+        tracing::info!("Running forge script: {script_path}");
+        let contracts = run_forge_script(project_root, script_path).await?;
+        return Ok(LocalSourceConfig::from_discovered(
+            project_root.to_path_buf(),
+            None,
+            contracts,
+        ));
+    }
+
+    bail!(
+        "No contracts found. Please provide one of:\n\
+         - edb.local.json in the project root\n\
+         - Deployed contracts in broadcast/ directory\n\
+         - --script <path> to run a deployment script"
+    )
+}
+
+/// Parse Foundry's broadcast directory to extract deployed contracts.
+fn parse_broadcast_dir(broadcast_dir: &Path, contract_name: Option<&str>) -> Result<Vec<DiscoveredContract>> {
+    let mut contracts = Vec::new();
+
+    // Walk through broadcast/<script>/<chain-id>/run-latest.json
+    for entry in std::fs::read_dir(broadcast_dir).wrap_err("failed to read broadcast directory")? {
+        let entry = entry?;
+        let script_dir = entry.path();
+        if !script_dir.is_dir() {
+            continue;
+        }
+
+        // Look for chain ID directories (e.g., 31337 for anvil)
+        for chain_entry in std::fs::read_dir(&script_dir)? {
+            let chain_entry = chain_entry?;
+            let chain_dir = chain_entry.path();
+            if !chain_dir.is_dir() {
+                continue;
+            }
+
+            let run_latest = chain_dir.join("run-latest.json");
+            if !run_latest.exists() {
+                continue;
+            }
+
+            // Parse the run-latest.json file
+            let content = std::fs::read_to_string(&run_latest)?;
+            let run_data: serde_json::Value = serde_json::from_str(&content)?;
+
+            if let Some(transactions) = run_data.get("transactions").and_then(|t| t.as_array()) {
+                for tx in transactions {
+                    let tx_type = tx.get("transactionType").and_then(|t| t.as_str()).unwrap_or("");
+
+                    // Only interested in CREATE transactions (contract deployments)
+                    if tx_type != "CREATE" {
+                        continue;
+                    }
+
+                    let contract_addr = tx
+                        .get("contractAddress")
+                        .and_then(|a| a.as_str())
+                        .and_then(|s| s.parse::<Address>().ok());
+
+                    let name = tx.get("contractName").and_then(|n| n.as_str()).map(String::from);
+
+                    let tx_hash = tx
+                        .get("hash")
+                        .and_then(|h| h.as_str())
+                        .and_then(|s| s.parse::<TxHash>().ok());
+
+                    if let (Some(address), Some(name), Some(hash)) = (contract_addr, name, tx_hash) {
+                        // Filter by contract name if specified
+                        if let Some(filter) = contract_name {
+                            if name != filter {
+                                continue;
+                            }
+                        }
+
+                        // Try to find the source file
+                        let source = find_source_file(tx.get("arguments"), &name)?;
+
+                        // Extract constructor arguments
+                        let constructor_args = tx
+                            .get("arguments")
+                            .and_then(|a| a.as_str())
+                            .map(|s| Bytes::from(s.trim_start_matches("0x").as_bytes()))
+                            .unwrap_or_default();
+
+                        contracts.push(DiscoveredContract {
+                            address,
+                            name,
+                            source,
+                            creation_tx: hash,
+                            constructor_args,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(contracts)
+}
+
+/// Find the source file for a contract.
+fn find_source_file(_arguments: Option<&serde_json::Value>, contract_name: &str) -> Result<PathBuf> {
+    // Simple heuristic: assume src/<ContractName>.sol
+    // In a real implementation, we'd parse the compilation artifacts
+    Ok(PathBuf::from(format!("src/{contract_name}.sol")))
+}
+
+/// Run a forge script and parse the output for deployed contracts.
+async fn run_forge_script(project_root: &Path, script_path: &str) -> Result<Vec<DiscoveredContract>> {
+    // This is a placeholder - in a real implementation, we'd:
+    // 1. Run `forge script <script_path> --broadcast --json`
+    // 2. Parse the output for deployed contracts
+    // 3. Extract addresses and tx hashes
+
+    bail!(
+        "forge script execution not yet implemented.\n\
+         Please use edb.local.json or broadcast/ directory instead.\n\
+         Script requested: {script_path}"
+    )
+}
+
+/// Execute a test transaction and return its hash.
+async fn execute_test_transaction(project_root: &Path, rpc_url: &str) -> Result<TxHash> {
+    // Check if there's a test transaction defined in edb.local.json
+    let config_path = project_root.join("edb.local.json");
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        let config: serde_json::Value = serde_json::from_str(&content)?;
+
+        if let Some(test_tx) = config.get("test_transaction") {
+            tracing::info!("Executing test transaction from config");
+            return execute_cast_command(test_tx, rpc_url).await;
+        }
+    }
+
+    // Try to run a test script
+    let test_script = project_root.join("script/Test.s.sol");
+    if test_script.exists() {
+        tracing::info!("Running test script: script/Test.s.sol");
+        return run_test_script(project_root, "script/Test.s.sol", rpc_url).await;
+    }
+
+    bail!(
+        "No test transaction found. Please provide one of:\n\
+         - test_transaction in edb.local.json\n\
+         - script/Test.s.sol\n\
+         - --tx-hash <hash> to specify the transaction directly"
+    )
+}
+
+/// Execute a cast command to send a transaction.
+async fn execute_cast_command(test_tx: &serde_json::Value, rpc_url: &str) -> Result<TxHash> {
+    let to = test_tx
+        .get("to")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| eyre::eyre!("test_transaction.to is required"))?;
+
+    let function = test_tx
+        .get("function")
+        .and_then(|f| f.as_str())
+        .ok_or_else(|| eyre::eyre!("test_transaction.function is required"))?;
+
+    let args = test_tx
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // Build cast command
+    let mut cmd = tokio::process::Command::new("cast");
+    cmd.args(["send", "--rpc-url", rpc_url, "--private-key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"]);
+    cmd.arg(to);
+    cmd.arg(function);
+    cmd.args(args);
+    cmd.arg("--json");
+
+    let output = cmd.output().await.wrap_err("failed to execute cast")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("cast send failed: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout)?;
+
+    let tx_hash = result
+        .get("transactionHash")
+        .and_then(|h| h.as_str())
+        .and_then(|s| s.parse::<TxHash>().ok())
+        .ok_or_else(|| eyre::eyre!("failed to parse transaction hash from cast output"))?;
+
+    Ok(tx_hash)
+}
+
+/// Run a test script and extract the transaction hash.
+async fn run_test_script(project_root: &Path, script_path: &str, rpc_url: &str) -> Result<TxHash> {
+    // This is a placeholder - in a real implementation, we'd:
+    // 1. Run `forge script <script_path> --rpc-url <rpc_url> --broadcast --json`
+    // 2. Parse the output for the transaction hash
+
+    bail!(
+        "test script execution not yet implemented.\n\
+         Please use --tx-hash to specify the transaction directly,\n\
+         or define test_transaction in edb.local.json."
+    )
+}
