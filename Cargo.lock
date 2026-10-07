@@ -2156,6 +2156,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",

@@ -407,3 +407,185 @@ async fn run_test_script(project_root: &Path, script_path: &str, rpc_url: &str) 
          or define test_transaction in edb.local.json."
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_validate_project_path_valid() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("foundry.toml"), "[profile.default]\n").unwrap();
+        let result = validate_project_path(tmp.path());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn test_validate_project_path_missing() {
+        let result = validate_project_path(Path::new("/nonexistent/path"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_validate_project_path_no_foundry_toml() {
+        let tmp = TempDir::new().unwrap();
+        let result = validate_project_path(tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a Foundry project"));
+    }
+
+    #[test]
+    fn test_validate_project_path_file_input() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("foundry.toml"), "[profile.default]\n").unwrap();
+        let config_file = tmp.path().join("edb.local.json");
+        fs::write(&config_file, "{}").unwrap();
+        let result = validate_project_path(&config_file);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn test_parse_broadcast_dir_empty() {
+        let tmp = TempDir::new().unwrap();
+        let broadcast_dir = tmp.path().join("broadcast");
+        fs::create_dir(&broadcast_dir).unwrap();
+        let result = parse_broadcast_dir(&broadcast_dir, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_broadcast_dir_with_deployments() {
+        let tmp = TempDir::new().unwrap();
+        let broadcast_dir = tmp.path().join("broadcast");
+        let script_dir = broadcast_dir.join("Deploy.s.sol");
+        let chain_dir = script_dir.join("31337");
+        fs::create_dir_all(&chain_dir).unwrap();
+
+        let run_latest = serde_json::json!({
+            "transactions": [
+                {
+                    "transactionType": "CREATE",
+                    "contractAddress": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+                    "contractName": "MyContract",
+                    "hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                }
+            ]
+        });
+        fs::write(chain_dir.join("run-latest.json"), run_latest.to_string()).unwrap();
+
+        let result = parse_broadcast_dir(&broadcast_dir, None);
+        assert!(result.is_ok());
+        let contracts = result.unwrap();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].name, "MyContract");
+        assert_eq!(
+            contracts[0].address.to_string(),
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+        );
+    }
+
+    #[test]
+    fn test_parse_broadcast_dir_with_filter() {
+        let tmp = TempDir::new().unwrap();
+        let broadcast_dir = tmp.path().join("broadcast");
+        let script_dir = broadcast_dir.join("Deploy.s.sol");
+        let chain_dir = script_dir.join("31337");
+        fs::create_dir_all(&chain_dir).unwrap();
+
+        let run_latest = serde_json::json!({
+            "transactions": [
+                {
+                    "transactionType": "CREATE",
+                    "contractAddress": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+                    "contractName": "ContractA",
+                    "hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                },
+                {
+                    "transactionType": "CREATE",
+                    "contractAddress": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+                    "contractName": "ContractB",
+                    "hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                }
+            ]
+        });
+        fs::write(chain_dir.join("run-latest.json"), run_latest.to_string()).unwrap();
+
+        let result = parse_broadcast_dir(&broadcast_dir, Some("ContractB"));
+        assert!(result.is_ok());
+        let contracts = result.unwrap();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].name, "ContractB");
+    }
+
+    #[test]
+    fn test_parse_broadcast_dir_ignores_calls() {
+        let tmp = TempDir::new().unwrap();
+        let broadcast_dir = tmp.path().join("broadcast");
+        let script_dir = broadcast_dir.join("Deploy.s.sol");
+        let chain_dir = script_dir.join("31337");
+        fs::create_dir_all(&chain_dir).unwrap();
+
+        let run_latest = serde_json::json!({
+            "transactions": [
+                {
+                    "transactionType": "CREATE",
+                    "contractAddress": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+                    "contractName": "MyContract",
+                    "hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                },
+                {
+                    "transactionType": "CALL",
+                    "contractAddress": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+                    "contractName": "OtherContract",
+                    "hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                }
+            ]
+        });
+        fs::write(chain_dir.join("run-latest.json"), run_latest.to_string()).unwrap();
+
+        let result = parse_broadcast_dir(&broadcast_dir, None);
+        assert!(result.is_ok());
+        let contracts = result.unwrap();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].name, "MyContract");
+    }
+
+    #[test]
+    fn test_load_existing_config_missing() {
+        let tmp = TempDir::new().unwrap();
+        let result = load_existing_config(tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No edb.local.json"));
+    }
+
+    #[test]
+    fn test_load_existing_config_valid() {
+        let tmp = TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "project_root": tmp.path().to_str().unwrap(),
+            "solc_version": "0.8.26",
+            "contracts": [
+                {
+                    "address": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+                    "name": "MyContract",
+                    "source": "src/MyContract.sol",
+                    "creation_tx": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                    "constructor_args": "0x"
+                }
+            ]
+        });
+        fs::write(tmp.path().join("edb.local.json"), config.to_string()).unwrap();
+
+        let result = load_existing_config(tmp.path());
+        assert!(result.is_ok());
+        let loaded = result.unwrap();
+        assert_eq!(loaded.contracts.len(), 1);
+        assert_eq!(loaded.contracts[0].name, "MyContract");
+    }
+}

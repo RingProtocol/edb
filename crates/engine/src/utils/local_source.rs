@@ -363,3 +363,96 @@ fn fabricate_metadata(
     );
     Ok(meta)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{address, bytes};
+
+    fn make_discovered(suffix: u8) -> DiscoveredContract {
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes[19] = suffix;
+        DiscoveredContract {
+            address: Address::from(addr_bytes),
+            name: format!("Contract{suffix}"),
+            source: PathBuf::from(format!("src/Contract{suffix}.sol")),
+            creation_tx: TxHash::from([suffix; 32]),
+            constructor_args: Bytes::from(vec![suffix; 4]),
+        }
+    }
+
+    #[test]
+    fn test_from_discovered_empty() {
+        let config = LocalSourceConfig::from_discovered(
+            PathBuf::from("/tmp/project"),
+            Some("0.8.26".to_string()),
+            vec![],
+        );
+        assert!(config.contracts.is_empty());
+        assert_eq!(config.project_root, PathBuf::from("/tmp/project"));
+        assert_eq!(config.solc_version, Some("0.8.26".to_string()));
+    }
+
+    #[test]
+    fn test_from_discovered_single() {
+        let d = make_discovered(1);
+        let config = LocalSourceConfig::from_discovered(
+            PathBuf::from("/tmp/project"),
+            None,
+            vec![d.clone()],
+        );
+        assert_eq!(config.contracts.len(), 1);
+        assert_eq!(config.contracts[0].address, d.address);
+        assert_eq!(config.contracts[0].name, "Contract1");
+        assert_eq!(config.contracts[0].source, PathBuf::from("src/Contract1.sol"));
+        assert_eq!(config.contracts[0].creation_tx, d.creation_tx);
+        assert_eq!(config.contracts[0].constructor_args, d.constructor_args);
+    }
+
+    #[test]
+    fn test_from_discovered_multiple() {
+        let contracts = vec![make_discovered(1), make_discovered(2), make_discovered(3)];
+        let config = LocalSourceConfig::from_discovered(
+            PathBuf::from("/tmp/project"),
+            Some("0.8.28".to_string()),
+            contracts,
+        );
+        assert_eq!(config.contracts.len(), 3);
+        assert_eq!(config.solc_version, Some("0.8.28".to_string()));
+    }
+
+    #[test]
+    fn test_creation_txs() {
+        let d1 = make_discovered(1);
+        let d2 = make_discovered(2);
+        let config = LocalSourceConfig::from_discovered(
+            PathBuf::from("/tmp/project"),
+            None,
+            vec![d1.clone(), d2.clone()],
+        );
+        let txs = config.creation_txs();
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[&d1.address], d1.creation_tx);
+        assert_eq!(txs[&d2.address], d2.creation_tx);
+    }
+
+    #[test]
+    fn test_from_discovered_preserves_constructor_args() {
+        let d = DiscoveredContract {
+            address: address!("0x5fbdb2315678afecb367f032d93f642f64180aa3"),
+            name: "MyContract".to_string(),
+            source: PathBuf::from("src/MyContract.sol"),
+            creation_tx: TxHash::from([0xAB; 32]),
+            constructor_args: bytes!("0000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3"),
+        };
+        let config = LocalSourceConfig::from_discovered(
+            PathBuf::from("/tmp/project"),
+            None,
+            vec![d],
+        );
+        assert_eq!(
+            config.contracts[0].constructor_args,
+            bytes!("0000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3")
+        );
+    }
+}
