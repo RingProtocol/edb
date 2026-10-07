@@ -273,11 +273,14 @@ fn parse_broadcast_dir(broadcast_dir: &Path, contract_name: Option<&str>) -> Res
                         // Try to find the source file
                         let source = find_source_file(tx.get("arguments"), &name)?;
 
-                        // Extract constructor arguments
+                        // Extract constructor arguments (hex-encoded)
                         let constructor_args = tx
                             .get("arguments")
                             .and_then(|a| a.as_str())
-                            .map(|s| Bytes::from(s.trim_start_matches("0x").as_bytes()))
+                            .map(|s| {
+                                let hex_str = s.trim_start_matches("0x");
+                                format!("0x{hex_str}").parse::<Bytes>().unwrap_or_default()
+                            })
                             .unwrap_or_default();
 
                         contracts.push(DiscoveredContract {
